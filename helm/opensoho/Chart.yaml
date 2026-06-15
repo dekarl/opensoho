@@ -3,7 +3,7 @@ name: opensoho
 description: A Helm chart for OpenSoho - OpenWrt management platform
 type: application
 version: 0.2.0
-appVersion: "v0.7.3"
+appVersion: "v0.13.0"
 keywords:
   - opensoho
   - openwrt

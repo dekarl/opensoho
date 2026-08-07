@@ -24,6 +24,7 @@ import (
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/liyue201/goqr"
 	"github.com/pocketbase/dbx"
+	"github.com/rubenbe/opensoho/frequencyplan"
 	"github.com/rubenbe/opensoho/lldp"
 	"github.com/rubenbe/pocketbase/core"
 	"github.com/rubenbe/pocketbase/tests"
@@ -161,6 +162,133 @@ func TestReportStatusEndpoint(t *testing.T) {
 	assert.Equal(t, "a3qnbxklglw121g", record.Id)
 	assert.Equal(t, "healthy", record.GetString("config_status"))
 	assert.Equal(t, "", record.GetString("error_reason"))
+}
+
+func TestRssiOverviewEndpoint(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	vlancollection := setupVlanCollection(t, app)
+	wificollection := setupWifiCollection(t, app, vlancollection)
+	devicecollection := setupDeviceCollection(t, app, wificollection)
+
+	// connected_clients is a view collection in production; the handler only
+	// calls FindAllRecords + GetString/GetInt, so a base collection with the same
+	// fields is equivalent here (mirrors the setupClientsCollection workaround).
+	connectedcollection := core.NewBaseCollection("connected_clients")
+	connectedcollection.Fields.Add(&core.TextField{
+		Name:     "device",
+		Required: false,
+	})
+	connectedcollection.Fields.Add(&core.NumberField{
+		Name:     "frequency",
+		Required: false,
+	})
+	connectedcollection.Fields.Add(&core.NumberField{
+		Name:     "signal",
+		Required: false,
+	})
+	err := app.Save(connectedcollection)
+	assert.Equal(t, nil, err)
+
+	// Devices: names resolve in the marker output.
+	d1 := core.NewRecord(devicecollection)
+	d1.Set("name", "the_device1")
+	d1.Set("health_status", "healthy")
+	err = app.Save(d1)
+	assert.Equal(t, nil, err)
+
+	d2 := core.NewRecord(devicecollection)
+	d2.Set("name", "the_device2")
+	d2.Set("health_status", "healthy")
+	err = app.Save(d2)
+	assert.Equal(t, nil, err)
+
+	// Clients: valid ones plus the skip-rule cases (unset signal, no device,
+	// 60 GHz band).
+	add := func(device string, frequency, signal int) {
+		c := core.NewRecord(connectedcollection)
+		c.Set("device", device)
+		c.Set("frequency", frequency)
+		c.Set("signal", signal)
+		err := app.Save(c)
+		assert.Equal(t, nil, err)
+	}
+	add(d1.Id, 2412, -60)  // 2.4
+	add(d1.Id, 2437, -88)  // 2.4, worst for d1
+	add(d1.Id, 5180, -72)  // 5
+	add(d2.Id, 5200, -95)  // 5, worst for d2
+	add(d1.Id, 58320, -70) // 60 GHz -> skipped
+	add(d1.Id, 2412, 0)    // unset signal -> skipped
+	add("", 2412, -65)     // no device -> skipped
+
+	// Drive the handler the way the router would (pattern of TestReportStatusEndpoint).
+	event := core.RequestEvent{}
+	event.Request, err = http.NewRequest("GET", "/api/v1/rssi-overview", nil)
+	assert.Equal(t, nil, err)
+	event.App = app
+	rec := httptest.NewRecorder()
+	event.Response = rec
+
+	err = apiRssiOverview(&event)
+	assert.Equal(t, nil, err)
+
+	httpResponse := rec.Result()
+	defer httpResponse.Body.Close()
+	body, err := io.ReadAll(httpResponse.Body)
+	assert.Equal(t, nil, err)
+	assert.Equal(t, 200, httpResponse.StatusCode)
+
+	var payload struct {
+		Bands []struct {
+			Band      string `json:"band"`
+			Label     string `json:"label"`
+			Min       int    `json:"min"`
+			Max       int    `json:"max"`
+			RedUntil  int    `json:"redUntil"`
+			GreenFrom int    `json:"greenFrom"`
+			Markers   []struct {
+				Id          string `json:"id"`
+				Name        string `json:"name"`
+				Rssi        int    `json:"rssi"`
+				ClientCount int    `json:"clientCount"`
+			} `json:"markers"`
+		} `json:"bands"`
+	}
+	err = json.Unmarshal(body, &payload)
+	assert.Equal(t, nil, err)
+
+	assert.Len(t, payload.Bands, 3)
+	assert.Equal(t, "2.4", payload.Bands[0].Band)
+	assert.Equal(t, "5", payload.Bands[1].Band)
+	assert.Equal(t, "6", payload.Bands[2].Band)
+
+	for _, b := range payload.Bands {
+		assert.Equal(t, frequencyplan.RssiMin, b.Min)
+		assert.Equal(t, frequencyplan.RssiMax, b.Max)
+		assert.Equal(t, frequencyplan.RssiRedUntil, b.RedUntil)
+		assert.Equal(t, frequencyplan.RssiGreenFrom, b.GreenFrom)
+	}
+
+	// 2.4 GHz: only d1, at its worst signal -88, counting its two valid clients.
+	b24 := payload.Bands[0]
+	assert.Len(t, b24.Markers, 1)
+	assert.Equal(t, d1.Id, b24.Markers[0].Id)
+	assert.Equal(t, "the_device1", b24.Markers[0].Name)
+	assert.Equal(t, -88, b24.Markers[0].Rssi)
+	assert.Equal(t, 2, b24.Markers[0].ClientCount)
+
+	// 5 GHz: both devices, sorted by name, worst signal per AP.
+	b5 := payload.Bands[1]
+	assert.Len(t, b5.Markers, 2)
+	assert.Equal(t, d1.Id, b5.Markers[0].Id)
+	assert.Equal(t, -72, b5.Markers[0].Rssi)
+	assert.Equal(t, 1, b5.Markers[0].ClientCount)
+	assert.Equal(t, d2.Id, b5.Markers[1].Id)
+	assert.Equal(t, -95, b5.Markers[1].Rssi)
+	assert.Equal(t, 1, b5.Markers[1].ClientCount)
+
+	// 6 GHz: everything was skipped.
+	b6 := payload.Bands[2]
+	assert.Empty(t, b6.Markers)
 }
 
 func TestRegenerateAllDeviceConfigs(t *testing.T) {

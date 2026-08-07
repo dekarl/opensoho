@@ -2688,6 +2688,7 @@ table.table > thead > tr > th > div.col-header-content > span.txt
 
 			e.Router.GET("/api/v1/devicestatus/{mac_address}", apiGenerateDeviceStatus).Bind(apis.RequireAuth())
 			e.Router.GET("/api/v1/frequency-overview", apiFrequencyOverview).Bind(apis.RequireAuth())
+			e.Router.GET("/api/v1/rssi-overview", apiRssiOverview).Bind(apis.RequireAuth())
 			e.Router.GET("/api/v1/network-overview", apiNetworkOverview).Bind(apis.RequireAuth())
 
 			return e.Next()
@@ -3047,6 +3048,39 @@ func apiFrequencyOverview(e *core.RequestEvent) error {
 		"scope":   scope,
 		"devices": devices,
 		"bands":   frequencyplan.BuildOverview(radios, freqs, deviceNames),
+	})
+}
+
+// apiRssiOverview builds the dashboard's per-band RSSI overview: one bar per
+// Wi-Fi band with one marker per access point at the worst client signal on
+// that band. Aggregates all devices (no scope filter).
+func apiRssiOverview(e *core.RequestEvent) error {
+	deviceRecords, err := e.App.FindAllRecords("devices")
+	if err != nil {
+		return e.InternalServerError("Failed to load devices", err)
+	}
+
+	deviceNames := map[string]string{}
+	for _, d := range deviceRecords {
+		deviceNames[d.Id] = d.GetString("name")
+	}
+
+	clientRecords, err := e.App.FindAllRecords("connected_clients")
+	if err != nil {
+		return e.InternalServerError("Failed to load connected clients", err)
+	}
+
+	clients := make([]frequencyplan.Client, 0, len(clientRecords))
+	for _, c := range clientRecords {
+		clients = append(clients, frequencyplan.Client{
+			Device:    c.GetString("device"),
+			Frequency: c.GetInt("frequency"),
+			Signal:    c.GetInt("signal"),
+		})
+	}
+
+	return e.JSON(200, map[string]any{
+		"bands": frequencyplan.BuildRssiOverview(clients, deviceNames),
 	})
 }
 

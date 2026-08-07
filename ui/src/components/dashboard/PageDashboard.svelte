@@ -9,6 +9,7 @@
     import ClientSignalQualityChart from "@/components/dashboard/ClientSignalQualityChart.svelte";
     import FrequencyOverview from "@/components/dashboard/FrequencyOverview.svelte";
     import NetworkOverview from "@/components/dashboard/NetworkOverview.svelte";
+    import RssiOverview from "@/components/dashboard/RssiOverview.svelte";
 
     $pageTitle = "Dashboard";
 
@@ -18,6 +19,7 @@
     let clientSignalQualityChart;
     let frequencyOverview;
     let networkOverview;
+    let rssiOverview;
 
     function refreshAll() {
         deviceHealthChart?.load();
@@ -26,6 +28,7 @@
         clientSignalQualityChart?.load();
         frequencyOverview?.load();
         networkOverview?.load();
+        rssiOverview?.load();
     }
 
     const refreshInterval = setInterval(refreshAll, 15000);
@@ -64,6 +67,10 @@
         <div class="dashboard-card wide">
             <h6 class="card-title">Frequency Overview</h6>
             <FrequencyOverview bind:this={frequencyOverview} />
+        </div>
+        <div class="dashboard-card wide">
+            <h6 class="card-title">RSSI Overview</h6>
+            <RssiOverview bind:this={rssiOverview} />
         </div>
         <div class="dashboard-card wide">
             <h6 class="card-title">Network Overview</h6>

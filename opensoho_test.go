@@ -28,11 +28,14 @@ import (
 	"github.com/rubenbe/opensoho/lldp"
 	"github.com/rubenbe/opensoho/records"
 	"github.com/rubenbe/pocketbase/core"
+	_ "github.com/rubenbe/pocketbase/migrations"
+	"github.com/rubenbe/pocketbase/plugins/jsvm"
 	"github.com/rubenbe/pocketbase/tests"
 	"github.com/rubenbe/pocketbase/tools/hook"
 	"github.com/rubenbe/pocketbase/tools/router"
 	"github.com/rubenbe/pocketbase/tools/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 /*
@@ -9027,4 +9030,147 @@ func TestDeviceDeleteError(t *testing.T) {
 	plain := errors.New("plain")
 	assert.Same(t, plain, deviceDeleteError("OpenWrt-Garage", plain))
 	assert.Nil(t, deviceDeleteError("OpenWrt-Garage", nil))
+}
+
+var (
+	loadJSMigrations sync.Once
+	jsMigrations     core.MigrationsList
+)
+
+// pbMigrations registers the JS migrations from pb_migrations into the global
+// core.AppMigrations list and collects them into a separate list, restoring
+// the original afterwards so tests.NewTestApp (which only runs the system
+// migrations) is unaffected.
+func pbMigrations() core.MigrationsList {
+	loadJSMigrations.Do(func() {
+		orig := core.AppMigrations
+		core.AppMigrations = core.MigrationsList{}
+		jsvm.MustRegister(core.NewBaseApp(core.BaseAppConfig{}), jsvm.Config{MigrationsDir: "pb_migrations"})
+		jsMigrations = core.AppMigrations
+		core.AppMigrations = orig
+		if len(jsMigrations.Items()) == 0 {
+			panic("no JS migrations found in pb_migrations")
+		}
+	})
+	return jsMigrations
+}
+
+// setupMigratedMemoryApp returns an app backed by in-memory SQLite databases
+// with the real pb_migrations applied, so the actual schema (including the
+// connected_clients view) is available to endpoint tests.
+func setupMigratedMemoryApp(t *testing.T) core.App {
+	t.Helper()
+
+	dbPrefix := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir: t.TempDir(),
+		DBConnect: func(dbPath string) (*dbx.DB, error) {
+			name := dbPrefix + "_" + strings.TrimSuffix(dbPath[strings.LastIndex(dbPath, "/")+1:], ".db")
+			return dbx.Open("sqlite", fmt.Sprintf("file:/%s?vfs=memdb&_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)", name))
+		},
+	})
+	t.Cleanup(func() { app.ResetBootstrapState() })
+
+	require.NoError(t, app.Bootstrap())
+
+	migrations := core.MigrationsList{}
+	migrations.Copy(core.SystemMigrations)
+	migrations.Copy(pbMigrations())
+	_, err := core.NewMigrationsRunner(app, migrations).Up()
+	require.NoError(t, err)
+
+	return app
+}
+
+func TestRssiPerAccessPointEndpoint(t *testing.T) {
+	app := setupMigratedMemoryApp(t)
+
+	devices, err := app.FindCollectionByNameOrId("devices")
+	require.NoError(t, err)
+
+	newDevice := func(name string) *core.Record {
+		d := core.NewRecord(devices)
+		d.Set("name", name)
+		require.NoError(t, app.SaveNoValidate(d))
+		return d
+	}
+	d1 := newDevice("AP One")
+	d2 := newDevice("AP Two")
+
+	clients, err := app.FindCollectionByNameOrId("clients")
+	require.NoError(t, err)
+
+	// The connected_clients view only exposes clients whose "updated"
+	// autodate is within the last 30 seconds, so records saved here (whose
+	// "updated" is set automatically on save) are picked up.
+	newClient := func(mac string, device *core.Record, band string, signal float64) {
+		c := core.NewRecord(clients)
+		c.Set("mac_address", mac)
+		c.Set("device", device.Id)
+		c.Set("band", band)
+		c.Set("signal", signal)
+		require.NoError(t, app.SaveNoValidate(c))
+	}
+
+	// AP One on 2.4 GHz: two clients, worst (min) RSSI is -60.
+	newClient("AA:BB:CC:DD:EE:01", d1, "2.4", -45)
+	newClient("AA:BB:CC:DD:EE:02", d1, "2.4", -60)
+	// AP Two on 2.4 GHz: two clients, worst (min) RSSI is -65.
+	newClient("AA:BB:CC:DD:EE:03", d2, "2.4", -55)
+	newClient("AA:BB:CC:DD:EE:04", d2, "2.4", -65)
+	// AP One on 5 GHz: two clients, worst (min) RSSI is -75.
+	newClient("AA:BB:CC:DD:EE:05", d1, "5", -70)
+	newClient("AA:BB:CC:DD:EE:06", d1, "5", -75)
+	// A client with an empty band must be skipped by the endpoint.
+	newClient("AA:BB:CC:DD:EE:07", d1, "", -80)
+
+	event := core.RequestEvent{}
+	event.Request, err = http.NewRequest("GET", "/api/v1/rssi-per-access-point", strings.NewReader(""))
+	event.App = app
+	rec := httptest.NewRecorder()
+	event.Response = rec
+
+	require.NoError(t, apiRssiPerAccessPoint(&event))
+
+	httpResponse := rec.Result()
+	defer httpResponse.Body.Close()
+	body, err := io.ReadAll(httpResponse.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, httpResponse.StatusCode)
+
+	var result struct {
+		Bands []struct {
+			Key    string `json:"key"`
+			Label  string `json:"label"`
+			Points []struct {
+				Device string  `json:"device"`
+				Name   string  `json:"name"`
+				Rssi   float64 `json:"rssi"`
+			} `json:"points"`
+		} `json:"bands"`
+	}
+	require.NoError(t, json.Unmarshal(body, &result))
+
+	// Only 2.4 and 5 GHz have clients; 6 GHz is omitted.
+	require.Len(t, result.Bands, 2)
+
+	// Within each band the points are sorted by device name.
+	band24 := result.Bands[0]
+	assert.Equal(t, "2.4", band24.Key)
+	assert.Equal(t, "2.4 GHz", band24.Label)
+	require.Len(t, band24.Points, 2)
+	assert.Equal(t, "AP One", band24.Points[0].Name)
+	assert.Equal(t, d1.Id, band24.Points[0].Device)
+	assert.Equal(t, -60.0, band24.Points[0].Rssi) // worst of -45 and -60
+	assert.Equal(t, "AP Two", band24.Points[1].Name)
+	assert.Equal(t, d2.Id, band24.Points[1].Device)
+	assert.Equal(t, -65.0, band24.Points[1].Rssi) // worst of -55 and -65
+
+	band5 := result.Bands[1]
+	assert.Equal(t, "5", band5.Key)
+	assert.Equal(t, "5 GHz", band5.Label)
+	require.Len(t, band5.Points, 1)
+	assert.Equal(t, "AP One", band5.Points[0].Name)
+	assert.Equal(t, d1.Id, band5.Points[0].Device)
+	assert.Equal(t, -75.0, band5.Points[0].Rssi) // worst of -70 and -75
 }

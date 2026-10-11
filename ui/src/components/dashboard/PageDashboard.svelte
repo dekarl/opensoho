@@ -12,6 +12,7 @@
     import FrequencyOverview from "@/components/dashboard/FrequencyOverview.svelte";
     import NetworkOverview from "@/components/dashboard/NetworkOverview.svelte";
     import WifiVersionChart from "@/components/dashboard/WifiVersionChart.svelte";
+    import RssiPerAccessPointChart from "@/components/dashboard/RssiPerAccessPointChart.svelte";
 
     $pageTitle = "Dashboard";
 
@@ -22,6 +23,7 @@
     let frequencyOverview;
     let networkOverview;
     let wifiVersionChart;
+    let rssiPerAccessPointChart;
 
     // Remember dashboard card view preferences (e.g. the "Client Signal Quality"
     // menu options) across page loads.
@@ -52,6 +54,7 @@
         frequencyOverview?.load();
         networkOverview?.load();
         wifiVersionChart?.load();
+        rssiPerAccessPointChart?.load();
     }
 
     const refreshInterval = setInterval(refreshAll, 15000);
@@ -86,6 +89,10 @@
         <div class="dashboard-card">
             <h6 class="card-title">AP WiFi Versions</h6>
             <WifiVersionChart bind:this={wifiVersionChart} />
+        </div>
+        <div class="dashboard-card wide">
+            <h6 class="card-title">RSSI per Access Point</h6>
+            <RssiPerAccessPointChart bind:this={rssiPerAccessPointChart} />
         </div>
         <div class="dashboard-card">
             <div class="card-header">

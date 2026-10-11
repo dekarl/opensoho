@@ -3522,6 +3522,7 @@ table.table > thead > tr > th > div.col-header-content > span.txt
 			e.Router.GET("/api/v1/network-overview", apiNetworkOverview).Bind(apis.RequireAuth())
 			e.Router.GET("/api/v1/wifi-versions", apiWifiVersions).Bind(apis.RequireAuth())
 			e.Router.GET("/api/v1/client-signal-quality", apiClientSignalQuality).Bind(apis.RequireAuth())
+			e.Router.GET("/api/v1/rssi-per-access-point", apiRssiPerAccessPoint).Bind(apis.RequireAuth())
 
 			return e.Next()
 		},
@@ -4273,6 +4274,94 @@ func apiClientSignalQuality(e *core.RequestEvent) error {
 	overall, bands := buildSignalQuality(clients)
 	scale := signalQualityScale{Min: signalScaleMin, Max: signalScaleMax, BinSize: signalBinSize}
 	return e.JSON(200, map[string]any{"overall": overall, "bands": bands, "scale": scale})
+}
+
+// apiRssiPerAccessPoint returns one datapoint per access point per frequency
+// band, positioned on the worst (minimum) RSSI of all connected clients on
+// that band, for the dashboard's RSSI-per-access-point graph.
+func apiRssiPerAccessPoint(e *core.RequestEvent) error {
+	records, err := e.App.FindAllRecords("connected_clients")
+	if err != nil {
+		return e.InternalServerError("Failed to load connected clients", err)
+	}
+
+	// Group by device+band, tracking the worst (min) RSSI per group.
+	type key struct{ device, band string }
+	worst := map[key]float64{}
+	for _, r := range records {
+		device := r.GetString("device")
+		band := r.GetString("band")
+		if band == "" {
+			continue
+		}
+		signal := r.GetFloat("signal")
+		k := key{device, band}
+		if v, ok := worst[k]; !ok || signal < v {
+			worst[k] = signal
+		}
+	}
+
+	// Look up device names.
+	deviceNames := map[string]string{}
+	deviceRecords, err := e.App.FindAllRecords("devices")
+	if err != nil {
+		return e.InternalServerError("Failed to load devices", err)
+	}
+	for _, d := range deviceRecords {
+		deviceNames[d.Id] = d.GetString("name")
+	}
+
+	bandDefs := []struct{ key, label string }{
+		{"2.4", "2.4 GHz"},
+		{"5", "5 GHz"},
+		{"6", "6 GHz"},
+	}
+
+	type apPoint struct {
+		Device string  `json:"device"`
+		Name   string  `json:"name"`
+		Rssi   float64 `json:"rssi"`
+	}
+	type bandResult struct {
+		Key    string    `json:"key"`
+		Label  string    `json:"label"`
+		Points []apPoint `json:"points"`
+	}
+
+	// Build per-band point lists.
+	byBand := map[string][]apPoint{}
+	for k, rssi := range worst {
+		name := deviceNames[k.device]
+		if name == "" {
+			name = k.device
+		}
+		byBand[k.band] = append(byBand[k.band], apPoint{
+			Device: k.device,
+			Name:   name,
+			Rssi:   rssi,
+		})
+	}
+	// Sort points within each band by device name.
+	for b := range byBand {
+		sort.Slice(byBand[b], func(i, j int) bool {
+			return byBand[b][i].Name < byBand[b][j].Name
+		})
+	}
+
+	var bands []bandResult
+	for _, bd := range bandDefs {
+		points := byBand[bd.key]
+		if len(points) == 0 {
+			continue
+		}
+		bands = append(bands, bandResult{
+			Key:    bd.key,
+			Label:  bd.label,
+			Points: points,
+		})
+	}
+
+	return e.JSON(200, map[string]any{"bands": bands})
 }
 
 func apiNetworkOverview(e *core.RequestEvent) error {
